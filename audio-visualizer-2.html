@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Audio Visualizer</title>
+<style>
+  :root{
+    --bg:#0a0a12;
+    --panel:#13131f;
+    --accent:#7b5cff;
+    --accent2:#00e5c7;
+    --text:#e8e8f2;
+    --muted:#8888a0;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:'Segoe UI',system-ui,sans-serif;
+    min-height:100vh;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    padding:20px;
+  }
+  h1{
+    font-size:1.4rem;
+    font-weight:600;
+    margin:0 0 4px;
+    letter-spacing:0.5px;
+  }
+  .sub{color:var(--muted);font-size:0.85rem;margin-bottom:18px;}
+  .stage{
+    position:relative;
+    width:100%;
+    max-width:900px;
+    background:var(--panel);
+    border-radius:16px;
+    overflow:hidden;
+    box-shadow:0 0 0 1px rgba(255,255,255,0.05), 0 20px 60px rgba(0,0,0,0.5);
+  }
+  canvas{
+    display:block;
+    width:100%;
+    height:420px;
+    background:radial-gradient(ellipse at center, #16162a 0%, #0a0a12 100%);
+  }
+  .controls{
+    width:100%;
+    max-width:900px;
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    margin-top:16px;
+    align-items:center;
+  }
+  .group{
+    display:flex;
+    gap:8px;
+    background:var(--panel);
+    padding:8px;
+    border-radius:12px;
+    flex-wrap:wrap;
+  }
+  button, .filebtn{
+    background:#1e1e30;
+    color:var(--text);
+    border:1px solid rgba(255,255,255,0.08);
+    padding:9px 14px;
+    border-radius:8px;
+    font-size:0.85rem;
+    cursor:pointer;
+    transition:background 0.15s, transform 0.1s;
+  }
+  button:hover, .filebtn:hover{background:#2a2a42;}
+  button:active{transform:scale(0.97);}
+  button.active{
+    background:linear-gradient(135deg,var(--accent),var(--accent2));
+    color:#08080f;
+    font-weight:600;
+    border-color:transparent;
+  }
+  input[type=file]{display:none;}
+  .status{
+    font-size:0.8rem;
+    color:var(--muted);
+    margin-left:auto;
+    white-space:nowrap;
+  }
+  .row{display:flex;gap:10px;flex-wrap:wrap;width:100%;max-width:900px;margin-top:10px;align-items:center;}
+  label.small{font-size:0.75rem;color:var(--muted);display:flex;align-items:center;gap:6px;}
+  input[type=range]{accent-color:var(--accent);}
+</style>
+</head>
+<body>
+
+<h1>Audio Visualizer</h1>
+<div class="sub">Load a track or use your microphone, then pick a visual style</div>
+
+<div class="stage">
+  <canvas id="viz"></canvas>
+</div>
+
+<div class="controls">
+  <div class="group">
+    <label class="filebtn" for="fileInput">📁 Load Audio</label>
+    <input type="file" id="fileInput" accept="audio/*">
+    <button id="micBtn">🎤 Microphone</button>
+    <button id="playBtn" disabled>▶ Play</button>
+  </div>
+
+  <div class="group" id="styleGroup">
+    <button data-style="bars" class="active">Bars</button>
+    <button data-style="wave">Waveform</button>
+    <button data-style="circle">Circular</button>
+    <button data-style="particles">Particles</button>
+    <button data-style="network3d">3D Network</button>
+  </div>
+
+  <span class="status" id="status">No audio loaded</span>
+</div>
+
+<div class="row">
+  <label class="small">Sensitivity
+    <input type="range" id="sensitivity" min="0.5" max="3" step="0.1" value="1.3">
+  </label>
+  <label class="small">Smoothing
+    <input type="range" id="smoothing" min="0" max="0.95" step="0.05" value="0.75">
+  </label>
+</div>
+
+<audio id="audioEl" style="display:none"></audio>
+
+<script>
+(() => {
+  const canvas = document.getElementById('viz');
+  const ctx = canvas.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const fileInput = document.getElementById('fileInput');
+  const micBtn = document.getElementById('micBtn');
+  const playBtn = document.getElementById('playBtn');
+  const audioEl = document.getElementById('audioEl');
+  const styleButtons = document.querySelectorAll('#styleGroup button');
+  const sensitivitySlider = document.getElementById('sensitivity');
+  const smoothingSlider = document.getElementById('smoothing');
+
+  let audioCtx, analyser, sourceNode, dataArray, bufferLength;
+  let currentStyle = 'bars';
+  let animId = null;
+  let particles = [];
+  let particles3D = [];
+  let rotationY = 0, rotationX = 0;
+  let usingMic = false;
+
+  function resizeCanvas(){
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * devicePixelRatio;
+    canvas.height = rect.height * devicePixelRatio;
+  }
+  window.addEventListener('resize', resizeCanvas);
+  resizeCanvas();
+
+  function ensureAudioContext(){
+    if (!audioCtx){
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = parseFloat(smoothingSlider.value);
+      bufferLength = analyser.frequencyBinCount;
+      dataArray = new Uint8Array(bufferLength);
+    }
+  }
+
+  smoothingSlider.addEventListener('input', () => {
+    if (analyser) analyser.smoothingTimeConstant = parseFloat(smoothingSlider.value);
+  });
+
+  // ---- File loading ----
+  fileInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    usingMic = false;
+    ensureAudioContext();
+    if (sourceNode) { try { sourceNode.disconnect(); } catch(e){} }
+
+    const url = URL.createObjectURL(file);
+    audioEl.src = url;
+    sourceNode = audioCtx.createMediaElementSource(audioEl);
+    sourceNode.connect(analyser);
+    analyser.connect(audioCtx.destination);
+
+    statusEl.textContent = 'Loaded: ' + file.name;
+    playBtn.disabled = false;
+    playBtn.textContent = '▶ Play';
+  });
+
+  playBtn.addEventListener('click', async () => {
+    if (!audioEl.src) return;
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    if (audioEl.paused){
+      audioEl.play();
+      playBtn.textContent = '⏸ Pause';
+      startLoop();
+    } else {
+      audioEl.pause();
+      playBtn.textContent = '▶ Play';
+    }
+  });
+
+  audioEl.addEventListener('ended', () => {
+    playBtn.textContent = '▶ Play';
+  });
+
+  // ---- Microphone ----
+  micBtn.addEventListener('click', async () => {
+    try {
+      ensureAudioContext();
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (sourceNode) { try { sourceNode.disconnect(); } catch(e){} }
+      sourceNode = audioCtx.createMediaStreamSource(stream);
+      sourceNode.connect(analyser);
+      usingMic = true;
+      statusEl.textContent = 'Listening to microphone';
+      playBtn.disabled = true;
+      startLoop();
+    } catch(err){
+      statusEl.textContent = 'Mic access denied';
+    }
+  });
+
+  // ---- Style switching ----
+  styleButtons.forEach(btn => {
+    btn.addEventListener('click', () => {
+      styleButtons.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      currentStyle = btn.dataset.style;
+      if (currentStyle === 'particles' && particles.length === 0) initParticles();
+      if (currentStyle === 'network3d' && particles3D.length === 0) initParticles3D();
+    });
+  });
+
+  function initParticles3D(){
+    particles3D = [];
+    const count = 45;
+    const spread = 260;
+    for (let i=0;i<count;i++){
+      particles3D.push({
+        x: (Math.random()*2-1) * spread,
+        y: (Math.random()*2-1) * spread,
+        z: (Math.random()*2-1) * spread,
+        vx: (Math.random()*2-1) * 0.3,
+        vy: (Math.random()*2-1) * 0.3,
+        vz: (Math.random()*2-1) * 0.3
+      });
+    }
+  }
+  initParticles3D();
+
+  function initParticles(){
+    particles = [];
+    const count = 120;
+    for (let i=0;i<count;i++){
+      particles.push({
+        angle: Math.random()*Math.PI*2,
+        radius: 40 + Math.random()*60,
+        speed: 0.2 + Math.random()*0.6,
+        size: 1 + Math.random()*2
+      });
+    }
+  }
+  initParticles();
+
+  // ---- Drawing ----
+  function draw(){
+    animId = requestAnimationFrame(draw);
+    analyser.getByteFrequencyData(dataArray);
+
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0,0,w,h);
+
+    const sensitivity = parseFloat(sensitivitySlider.value);
+
+    if (currentStyle === 'bars') drawBars(w,h,sensitivity);
+    else if (currentStyle === 'wave') drawWave(w,h,sensitivity);
+    else if (currentStyle === 'circle') drawCircle(w,h,sensitivity);
+    else if (currentStyle === 'particles') drawParticles(w,h,sensitivity);
+    else if (currentStyle === 'network3d') drawNetwork3D(w,h,sensitivity);
+  }
+
+  function drawBars(w,h,sens){
+    const barCount = 64;
+    const step = Math.floor(bufferLength / barCount);
+    const barWidth = w / barCount;
+    for (let i=0;i<barCount;i++){
+      const v = dataArray[i*step] / 255 * sens;
+      const barHeight = Math.min(v * h * 0.9, h);
+      const hue = 250 - (i/barCount)*100;
+      ctx.fillStyle = `hsl(${hue}, 90%, ${55 + v*20}%)`;
+      const x = i*barWidth;
+      ctx.fillRect(x+1, h-barHeight, barWidth-2, barHeight);
+    }
+  }
+
+  function drawWave(w,h,sens){
+    analyser.getByteTimeDomainData(dataArray);
+    ctx.lineWidth = 3 * (window.devicePixelRatio||1);
+    ctx.strokeStyle = '#00e5c7';
+    ctx.beginPath();
+    const sliceWidth = w / bufferLength;
+    let x = 0;
+    for (let i=0;i<bufferLength;i++){
+      const v = (dataArray[i]/128.0 - 1) * sens;
+      const y = h/2 + v * h/2.2;
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      x += sliceWidth;
+    }
+    ctx.shadowBlur = 15;
+    ctx.shadowColor = '#00e5c7';
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
+  function drawCircle(w,h,sens){
+    const cx = w/2, cy = h/2;
+    const baseRadius = Math.min(w,h) * 0.18;
+    const bars = 90;
+    const step = Math.floor(bufferLength / bars);
+
+    ctx.save();
+    ctx.translate(cx,cy);
+    for (let i=0;i<bars;i++){
+      const v = dataArray[i*step] / 255 * sens;
+      const angle = (i / bars) * Math.PI * 2;
+      const len = baseRadius * 0.5 + v * baseRadius * 1.6;
+      const x1 = Math.cos(angle) * baseRadius;
+      const y1 = Math.sin(angle) * baseRadius;
+      const x2 = Math.cos(angle) * (baseRadius + len);
+      const y2 = Math.sin(angle) * (baseRadius + len);
+      const hue = 260 - (i/bars)*140;
+      ctx.strokeStyle = `hsl(${hue}, 85%, 60%)`;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(x1,y1);
+      ctx.lineTo(x2,y2);
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.arc(0,0,baseRadius*0.85,0,Math.PI*2);
+    ctx.fillStyle = 'rgba(123,92,255,0.15)';
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawParticles(w,h,sens){
+    const cx = w/2, cy = h/2;
+    let avg = 0;
+    for (let i=0;i<bufferLength;i++) avg += dataArray[i];
+    avg = (avg/bufferLength)/255 * sens;
+
+    ctx.fillStyle = 'rgba(10,10,18,0.25)';
+    ctx.fillRect(0,0,w,h);
+
+    particles.forEach((p, idx) => {
+      p.angle += p.speed * 0.01 * (1+avg*2);
+      const freqIdx = Math.floor((idx/particles.length) * bufferLength);
+      const v = dataArray[freqIdx]/255 * sens;
+      const r = p.radius + v * Math.min(w,h)*0.35;
+      const x = cx + Math.cos(p.angle) * r;
+      const y = cy + Math.sin(p.angle) * r;
+      const size = p.size * (1 + v*2);
+      const hue = 180 + v*140;
+      ctx.beginPath();
+      ctx.arc(x,y,size,0,Math.PI*2);
+      ctx.fillStyle = `hsl(${hue}, 90%, ${60 + v*20}%)`;
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = ctx.fillStyle;
+      ctx.fill();
+    });
+    ctx.shadowBlur = 0;
+  }
+
+  function drawNetwork3D(w,h,sens){
+    // overall audio energy + bass/treble split for varied reactivity
+    let bassSum = 0, trebSum = 0, totalSum = 0;
+    const bassEnd = Math.floor(bufferLength * 0.15);
+    for (let i=0;i<bufferLength;i++){
+      totalSum += dataArray[i];
+      if (i < bassEnd) bassSum += dataArray[i]; else trebSum += dataArray[i];
+    }
+    const avg = (totalSum/bufferLength)/255 * sens;
+    const bass = (bassSum/bassEnd)/255 * sens;
+    const treble = (trebSum/(bufferLength-bassEnd))/255 * sens;
+
+    // fading trail background for a subtle glow-trail feel
+    ctx.fillStyle = 'rgba(8,8,16,0.35)';
+    ctx.fillRect(0,0,w,h);
+
+    // slow auto-rotation, sped up a bit by treble
+    rotationY += 0.0025 + treble*0.006;
+    rotationX += 0.0009 + bass*0.002;
+
+    const cx = w/2, cy = h/2;
+    const fov = Math.min(w,h) * 0.9;
+    const cosY = Math.cos(rotationY), sinY = Math.sin(rotationY);
+    const cosX = Math.cos(rotationX), sinX = Math.sin(rotationX);
+
+    const projected = [];
+
+    particles3D.forEach((p, idx) => {
+      // audio-driven motion: bass pushes particles outward/inward, treble adds jitter
+      const freqIdx = Math.floor((idx/particles3D.length) * bufferLength);
+      const reactive = dataArray[freqIdx]/255 * sens;
+
+      const dist = Math.sqrt(p.x*p.x + p.y*p.y + p.z*p.z) || 1;
+      const pushForce = (bass - 0.4) * 1.8;
+      p.vx += (p.x/dist) * pushForce * 0.02;
+      p.vy += (p.y/dist) * pushForce * 0.02;
+      p.vz += (p.z/dist) * pushForce * 0.02;
+
+      // treble-driven jitter
+      p.vx += (Math.random()*2-1) * treble * 0.15;
+      p.vy += (Math.random()*2-1) * treble * 0.15;
+      p.vz += (Math.random()*2-1) * treble * 0.15;
+
+      // damping so it doesn't fly apart
+      p.vx *= 0.96; p.vy *= 0.96; p.vz *= 0.96;
+
+      p.x += p.vx; p.y += p.vy; p.z += p.vz;
+
+      // soft boundary pull-back
+      const maxR = 280;
+      const r = Math.sqrt(p.x*p.x + p.y*p.y + p.z*p.z);
+      if (r > maxR){
+        p.vx -= (p.x/r) * 0.4;
+        p.vy -= (p.y/r) * 0.4;
+        p.vz -= (p.z/r) * 0.4;
+      }
+
+      // rotate around Y then X
+      let x = p.x*cosY - p.z*sinY;
+      let z = p.x*sinY + p.z*cosY;
+      let y = p.y*cosX - z*sinX;
+      z = p.y*sinX + z*cosX;
+
+      const scale = fov / (fov + z + 400);
+      const sx = cx + x * scale;
+      const sy = cy + y * scale;
+
+      projected.push({sx, sy, scale, reactive, z});
+    });
+
+    // connect nearby dots with glowing lines
+    const linkDist = 110 + avg*70;
+    for (let i=0;i<projected.length;i++){
+      for (let j=i+1;j<projected.length;j++){
+        const a = projected[i], b = projected[j];
+        const dx = a.sx-b.sx, dy = a.sy-b.sy;
+        const d = Math.sqrt(dx*dx+dy*dy);
+        if (d < linkDist){
+          const alpha = (1 - d/linkDist) * (0.15 + avg*0.6);
+          const hue = 190 + avg*140;
+          ctx.strokeStyle = `hsla(${hue}, 90%, 65%, ${alpha})`;
+          ctx.lineWidth = (1 + avg*2) * (window.devicePixelRatio||1) * 0.6;
+          ctx.beginPath();
+          ctx.moveTo(a.sx, a.sy);
+          ctx.lineTo(b.sx, b.sy);
+          ctx.shadowBlur = 6 * (0.3+avg);
+          ctx.shadowColor = `hsla(${hue}, 100%, 70%, ${alpha})`;
+          ctx.stroke();
+        }
+      }
+    }
+    ctx.shadowBlur = 0;
+
+    // draw the dots on top, sized/brightened by their own frequency band + depth
+    projected
+      .sort((a,b) => a.z - b.z) // draw far ones first
+      .forEach(p => {
+        const size = (1.5 + p.reactive*4) * p.scale;
+        const hue = 260 - p.reactive*140;
+        ctx.beginPath();
+        ctx.arc(p.sx, p.sy, size, 0, Math.PI*2);
+        ctx.fillStyle = `hsl(${hue}, 95%, ${60 + p.reactive*25}%)`;
+        ctx.shadowBlur = 10 * (0.3 + p.reactive);
+        ctx.shadowColor = ctx.fillStyle;
+        ctx.fill();
+      });
+    ctx.shadowBlur = 0;
+  }
+
+  function startLoop(){
+    if (!animId) draw();
+  }
+
+  // idle animation before any audio loaded
+  function idleFrame(){
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0,0,w,h);
+    ctx.fillStyle = 'rgba(136,136,160,0.6)';
+    ctx.font = `${16*devicePixelRatio}px system-ui`;
+    ctx.textAlign = 'center';
+    ctx.fillText('Load a file or start the microphone to begin', w/2, h/2);
+    if (!audioCtx) requestAnimationFrame(idleFrame);
+  }
+  idleFrame();
+})();
+</script>
+</body>
+</html>
